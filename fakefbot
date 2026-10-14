@@ -1,0 +1,681 @@
+import asyncio
+import logging
+import os
+import re
+import aiohttp
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+)
+
+# ================= КОНФИГУРАЦИЯ =================
+BOT_TOKEN = "8863773985:AAFL4OjzgKwq136NuDnrz0dZjT_0Ga8Z3p8"
+SUPERGROUP_ID = -1003965182510  # ID вашей закрытой супергруппы (со знаком минус)
+
+# Поставьте True, если запускаете на бесплатном PythonAnywhere, или False — для своего ПК / VPS
+USE_PYTHONANYWHERE_PROXY = False
+
+# Настройки 4 основных категорий и фиксированных цен в крипто (USDT)
+SERVICES = {
+    "🎙 Голос": {"key": "voice", "price": "15 USDT"},
+    "🎬 Видео": {"key": "video", "price": "35 USDT"},
+    "📸 Фото": {"key": "photo", "price": "20 USDT"},
+    "🎭 IRL маска": {"key": "irl_mask", "price": "50 USDT"},
+}
+
+logging.basicConfig(level=logging.INFO)
+router = Router()
+
+
+# ================= СЕССИЯ ДЛЯ PYTHONANYWHERE =================
+class PythonAnywhereSession(AiohttpSession):
+    """Использует встроенный HTTP-прокси aiohttp (trust_env=True)"""
+    async def create_session(self) -> aiohttp.ClientSession:
+        if self._should_reset_connector:
+            await self.close()
+
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                connector=self._connector_type(**self._connector_init),
+                headers={"User-Agent": "aiogram/3.x"},
+                trust_env=True,
+            )
+            self._should_reset_connector = False
+
+        return self._session
+
+
+# ================= СОСТОЯНИЯ (FSM) =================
+class OrderFlow(StatesGroup):
+    choosing_service = State()
+    waiting_voice_sample = State()
+    waiting_creative_desc = State()
+    waiting_creative_files = State()
+    payment_or_approval = State()
+    waiting_review = State()
+
+
+# ================= КНОПКИ НА НИЖНЕЙ ПАНЕЛИ (ДЛЯ КЛИЕНТА) =================
+def get_main_panel_kb() -> ReplyKeyboardMarkup:
+    """Главное меню: 4 основные категории на нижней панели"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="🎙 Голос"),
+                KeyboardButton(text="🎬 Видео"),
+            ],
+            [
+                KeyboardButton(text="📸 Фото"),
+                KeyboardButton(text="🎭 IRL маска"),
+            ]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+def get_back_panel_kb() -> ReplyKeyboardMarkup:
+    """Панель с кнопкой возврата на шагах ввода данных"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔙 В главное меню")]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+def get_skip_files_panel_kb() -> ReplyKeyboardMarkup:
+    """Панель на шаге отправки файлов и референсов"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="⏭ Пропустить (без файлов)")],
+            [KeyboardButton(text="🔙 В главное меню")]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+def get_payment_panel_kb(price: str) -> ReplyKeyboardMarkup:
+    """Панель выбора: фиксированная цена или согласование с оператором"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=f"💎 Фиксированная цена ({price})")],
+            [KeyboardButton(text="👨‍💻 Согласовать с оператором")],
+            [KeyboardButton(text="🔙 В главное меню")]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+def get_confirm_order_panel_kb() -> ReplyKeyboardMarkup:
+    """Панель подтверждения приёма готового заказа клиентом"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="✅ Подтвердить приём заказа")],
+            [KeyboardButton(text="🔙 В главное меню")]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+def get_after_confirm_panel_kb() -> ReplyKeyboardMarkup:
+    """Две кнопки после подтверждения заказа: оставить отзыв и главное меню"""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="⭐️ Оставить отзыв"),
+                KeyboardButton(text="🔙 В главное меню"),
+            ]
+        ],
+        resize_keyboard=True,
+        is_persistent=True
+    )
+
+
+# ================= КНОПКИ КАРТОЧКИ ЗАКАЗА (В СУПЕРГРУППЕ) =================
+def get_supergroup_order_kb(client_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="🤖 Авто-задача (В AI-обработчик)",
+                callback_data=f"work:auto:{client_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="✋ Взять в работу (Ручная задача)",
+                callback_data=f"work:manual:{client_id}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="❌ Отказать (с пояснением причины)",
+                callback_data=f"work:reject:{client_id}"
+            )
+        ]
+    ])
+
+
+# ================= 1. СТАРТ И ГЛАВНОЕ МЕНЮ =================
+@router.message(CommandStart())
+async def cmd_start(message: Message, command: CommandObject, state: FSMContext):
+    await state.clear()
+    ad_source = command.args if command.args else "Прямой заход (Органика)"
+    await state.update_data(ad_source=ad_source)
+
+    await message.answer(
+        "👋 Добро пожаловать!\n"
+        f"📊 <i>Рекламный источник зафиксирован: {ad_source}</i>\n\n"
+        "Выберите нужную категорию на нижней панели:",
+        reply_markup=get_main_panel_kb()
+    )
+    await state.set_state(OrderFlow.choosing_service)
+
+
+@router.message(F.text == "🔙 В главное меню")
+async def panel_back_to_main(message: Message, state: FSMContext):
+    data = await state.get_data()
+    ad_source = data.get("ad_source", "Прямой заход (Органика)")
+    await state.clear()
+    await state.update_data(ad_source=ad_source)
+
+    await message.answer(
+        "Выберите нужную категорию на нижней панели:",
+        reply_markup=get_main_panel_kb()
+    )
+    await state.set_state(OrderFlow.choosing_service)
+
+
+# ================= 2. ВЫБОР ОДНОЙ ИЗ 4 КАТЕГОРИЙ С ПАНЕЛИ =================
+@router.message(F.text.in_(SERVICES.keys()))
+async def panel_choose_category(message: Message, state: FSMContext):
+    category_title = message.text
+    service_info = SERVICES[category_title]
+
+    data = await state.get_data()
+    ad_source = data.get("ad_source", "Прямой заход (Органика)")
+    await state.clear()
+    await state.update_data(
+        ad_source=ad_source,
+        service_title=category_title,
+        service_key=service_info["key"],
+        service_price=service_info["price"],
+    )
+
+    if service_info["key"] == "voice":
+        await message.answer(
+            f"<b>{category_title} — Голосовая модель</b>\n\n"
+            "Отправьте голосовое сообщение или аудиофайл (WAV/MP3) длительностью от 10 секунд "
+            "для автоматической проверки качества записи:",
+            reply_markup=get_back_panel_kb()
+        )
+        await state.set_state(OrderFlow.waiting_voice_sample)
+    else:
+        await message.answer(
+            f"<b>{category_title}</b>\n\n"
+            "Опишите вашу задачу текстом максимально подробно (желаемый результат, стиль, детали):",
+            reply_markup=get_back_panel_kb()
+        )
+        await state.set_state(OrderFlow.waiting_creative_desc)
+
+
+# ================= 2А. ВЕТКА «ГОЛОС» (ЗАГРУЗКА И ПРОВЕРКА КАЧЕСТВА) =================
+@router.message(OrderFlow.waiting_voice_sample, F.voice | F.audio | F.document)
+async def handle_voice_sample(message: Message, state: FSMContext):
+    file_id = None
+    media_type = None
+    duration = 0
+    file_size = 0
+
+    if message.voice:
+        file_id = message.voice.file_id
+        media_type = "voice"
+        duration = message.voice.duration
+        file_size = message.voice.file_size or 0
+    elif message.audio:
+        file_id = message.audio.file_id
+        media_type = "audio"
+        duration = message.audio.duration
+        file_size = message.audio.file_size or 0
+    elif message.document:
+        file_id = message.document.file_id
+        media_type = "document"
+        file_size = message.document.file_size or 0
+        duration = 15
+
+    if duration < 5 or file_size < 10_000:
+        await message.answer(
+            "⚠️ <b>Проверка качества не пройдена!</b>\n"
+            "Запись слишком короткая или низкого битрейта. "
+            "Отправьте более качественную и длинную запись (от 5–10 секунд):",
+            reply_markup=get_back_panel_kb()
+        )
+        return
+
+    data = await state.get_data()
+    price = data.get("service_price", "15 USDT")
+
+    await state.update_data(
+        file_id=file_id,
+        media_type=media_type,
+        description="Создание/клонирование голосовой модели"
+    )
+
+    await message.answer(
+        "✅ <b>Проверка качества пройдена!</b> Запись принята.\n\n"
+        "Переходим к расчёту стоимости и оплате:\n"
+        f"• Фиксированная стоимость: <b>{price}</b>\n"
+        "• Либо выберите согласование с оператором на нижней панели:",
+        reply_markup=get_payment_panel_kb(price)
+    )
+    await state.set_state(OrderFlow.payment_or_approval)
+
+
+@router.message(OrderFlow.waiting_voice_sample)
+async def handle_voice_invalid(message: Message):
+    await message.answer(
+        "Пожалуйста, отправьте аудиофайл, голосовое сообщение или нажмите «🔙 В главное меню» на панели.",
+        reply_markup=get_back_panel_kb()
+    )
+
+
+# ================= 2Б. ВЕТКИ «ВИДЕО», «ФОТО», «IRL МАСКА» =================
+@router.message(OrderFlow.waiting_creative_desc, F.text)
+async def handle_creative_desc(message: Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await message.answer(
+        "📝 Описание задачи сохранено!\n\n"
+        "Теперь прикрепите файл/фото/видео с референсом или нажмите кнопку "
+        "<b>«⏭ Пропустить (без файлов)»</b> на нижней панели:",
+        reply_markup=get_skip_files_panel_kb()
+    )
+    await state.set_state(OrderFlow.waiting_creative_files)
+
+
+@router.message(OrderFlow.waiting_creative_files)
+async def handle_creative_files(message: Message, state: FSMContext):
+    file_id = None
+    media_type = None
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.document:
+        file_id = message.document.file_id
+        media_type = "document"
+    elif message.video:
+        file_id = message.video.file_id
+        media_type = "video"
+    elif message.text and ("пропустить" in message.text.lower()):
+        pass
+    else:
+        await message.answer(
+            "Отправьте фото, видео, документ или нажмите кнопку «⏭ Пропустить (без файлов)» на нижней панели.",
+            reply_markup=get_skip_files_panel_kb()
+        )
+        return
+
+    data = await state.get_data()
+    price = data.get("service_price", "30 USDT")
+    service_title = data.get("service_title", "Заказ")
+
+    await state.update_data(file_id=file_id, media_type=media_type)
+
+    await message.answer(
+        f"✅ Данные для категории <b>{service_title}</b> собраны!\n\n"
+        "Переходим к расчёту стоимости и оплате:\n"
+        f"• Базовая фиксированная цена: <b>{price}</b>\n"
+        "• Либо выберите согласование с оператором на нижней панели:",
+        reply_markup=get_payment_panel_kb(price)
+    )
+    await state.set_state(OrderFlow.payment_or_approval)
+
+
+# ================= 3. РАСЧЁТ СТОИМОСТИ И ОТПРАВКА В СУПЕРГРУППУ =================
+@router.message(OrderFlow.payment_or_approval, F.text.startswith("💎 Фиксированная цена"))
+async def panel_fixed_price(message: Message, state: FSMContext, bot: Bot):
+    data = await state.get_data()
+    price = data.get("service_price", "USDT")
+    payment_status = f"💎 Выбрана фиксированная цена ({price})"
+    await send_order_to_supergroup(message, state, bot, payment_status)
+
+
+@router.message(OrderFlow.payment_or_approval, F.text == "👨‍💻 Согласовать с оператором")
+async def panel_operator_approval(message: Message, state: FSMContext, bot: Bot):
+    payment_status = "⏳ Требуется согласование стоимости с оператором"
+    await send_order_to_supergroup(message, state, bot, payment_status)
+
+
+@router.message(OrderFlow.payment_or_approval)
+async def panel_payment_invalid(message: Message, state: FSMContext):
+    data = await state.get_data()
+    price = data.get("service_price", "USDT")
+    await message.answer(
+        "Пожалуйста, выберите вариант на нижней панели кнопок:",
+        reply_markup=get_payment_panel_kb(price)
+    )
+
+
+async def send_order_to_supergroup(message: Message, state: FSMContext, bot: Bot, payment_status: str):
+    data = await state.get_data()
+    service_title = data.get("service_title", "Не указано")
+
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "без юзернейма"
+
+    order_text = (
+        f"🔔 <b>НОВАЯ ЗАЯВКА</b> [#ID_{user.id}]\n\n"
+        f"👤 <b>Клиент:</b> {user.full_name} ({username})\n"
+        f"📊 <b>Рекламный источник:</b> <code>{data.get('ad_source')}</code>\n"
+        f"🛠 <b>Категория:</b> {service_title}\n"
+        f"💰 <b>Условия оплаты:</b> {payment_status}\n"
+        f"📝 <b>Описание/ТЗ:</b>\n{data.get('description', 'Без описания')}\n"
+    )
+
+    file_id = data.get("file_id")
+    media_type = data.get("media_type")
+    kb = get_supergroup_order_kb(user.id)
+
+    try:
+        if file_id and media_type == "voice":
+            await bot.send_voice(SUPERGROUP_ID, voice=file_id, caption=order_text, reply_markup=kb)
+        elif file_id and media_type == "audio":
+            await bot.send_audio(SUPERGROUP_ID, audio=file_id, caption=order_text, reply_markup=kb)
+        elif file_id and media_type == "photo":
+            await bot.send_photo(SUPERGROUP_ID, photo=file_id, caption=order_text, reply_markup=kb)
+        elif file_id and media_type == "video":
+            await bot.send_video(SUPERGROUP_ID, video=file_id, caption=order_text, reply_markup=kb)
+        elif file_id and media_type == "document":
+            await bot.send_document(SUPERGROUP_ID, document=file_id, caption=order_text, reply_markup=kb)
+        else:
+            await bot.send_message(SUPERGROUP_ID, text=order_text, reply_markup=kb)
+    except Exception as e:
+        logging.error(f"Ошибка отправки в супергруппу: {e}")
+        await message.answer(
+            "⚠️ Произошла ошибка при передаче заявки. Проверьте настройки SUPERGROUP_ID и права бота в группе.",
+            reply_markup=get_main_panel_kb()
+        )
+        return
+
+    ad_source = data.get("ad_source", "Прямой заход (Органика)")
+    await state.clear()
+    await state.update_data(ad_source=ad_source)
+
+    await message.answer(
+        "🎉 <b>Ваша заявка принята и передана в супергруппу!</b>\n\n"
+        "Мы уведомим вас в этом чате, как только заказ будет взят в обработку и выполнен.",
+        reply_markup=get_main_panel_kb()
+    )
+    await state.set_state(OrderFlow.choosing_service)
+
+
+# ================= 4. ОБРАБОТКА В СУПЕРГРУППЕ =================
+@router.callback_query(F.data.startswith("work:"))
+async def cb_supergroup_action(callback: CallbackQuery, bot: Bot):
+    _, mode, client_id_str = callback.data.split(":")
+    client_id = int(client_id_str)
+    operator = callback.from_user.full_name
+
+    orig_text = callback.message.caption or callback.message.text or ""
+    clean_text = orig_text.split("\n\n⚠️ <b>ОЖИДАЕТСЯ ПРИЧИНА ОТКАЗА")[0]
+
+    if mode == "auto":
+        updated_text = (
+            f"{clean_text}\n\n"
+            f"⚡️ <b>Статус:</b> Передано в AI-обработчик ({operator})"
+        )
+        await _edit_group_msg(callback.message, updated_text, reply_markup=None)
+        await callback.answer("Отправлено в AI-обработчик!")
+
+        await bot.send_message(client_id, "🤖 Ваш заказ передан в автоматический AI-обработчик. Ожидайте результат...")
+        asyncio.create_task(run_ai_pipeline(bot, client_id, callback.message))
+
+    elif mode == "manual":
+        updated_text = (
+            f"{clean_text}\n\n"
+            f"👨‍💻 <b>Взял в работу (Ручная задача):</b> {operator}\n"
+            f"👉 <i>Чтобы выдать результат клиенту, ответьте (Reply) на это сообщение "
+            f"файлом, ZIP-архивом или ссылкой на скачивание.</i>"
+        )
+        await _edit_group_msg(callback.message, updated_text, reply_markup=None)
+        await callback.answer("Вы взяли заказ в работу!")
+
+        await bot.send_message(
+            client_id,
+            "👨‍💻 Исполнитель подключился к вашему заказу и начал подготовку материалов!"
+        )
+
+    elif mode == "reject":
+        updated_text = (
+            f"{clean_text}\n\n"
+            f"⚠️ <b>ОЖИДАЕТСЯ ПРИЧИНА ОТКАЗА</b> [#REJECT_{client_id}]\n"
+            f"👤 Инициатор отказа: {operator}\n"
+            f"👉 <i>Ответьте (Reply) текстовым сообщением на эту карточку и напишите причину отказа для клиента!</i>"
+        )
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Назад к выбору действий", callback_data=f"work:restore:{client_id}")]
+        ])
+        await _edit_group_msg(callback.message, updated_text, reply_markup=cancel_kb)
+        await callback.answer("Ответьте (Reply) на это сообщение и укажите причину отказа", show_alert=True)
+
+    elif mode == "restore":
+        await _edit_group_msg(callback.message, clean_text, reply_markup=get_supergroup_order_kb(client_id))
+        await callback.answer("Кнопки управления возвращены")
+
+
+async def _edit_group_msg(message: Message, new_text: str, reply_markup=None):
+    if message.caption is not None:
+        await message.edit_caption(caption=new_text, reply_markup=reply_markup)
+    else:
+        await message.edit_text(text=new_text, reply_markup=reply_markup)
+
+
+async def run_ai_pipeline(bot: Bot, client_id: int, group_message: Message):
+    await asyncio.sleep(5)
+    result_link = "https://example.com/download/ai_result_archive.zip"
+    await bot.send_message(
+        client_id,
+        "📦 <b>Ваш заказ готов! (Автоматическая обработка)</b>\n\n"
+        f"🔗 Ссылка на скачивание архива: {result_link}\n\n"
+        "Пожалуйста, проверьте материалы и нажмите кнопку <b>«✅ Подтвердить приём заказа»</b> на нижней панели:",
+        reply_markup=get_confirm_order_panel_kb()
+    )
+
+    orig_text = group_message.caption or group_message.text or ""
+    await _edit_group_msg(group_message, f"{orig_text}\n✅ <b>Выполнено автоматически (ожидает подтверждения клиента)</b>")
+
+
+# ================= 5. ВЫДАЧА РЕЗУЛЬТАТА ИЛИ ОТКАЗА КЛИЕНТУ =================
+@router.message(F.chat.id == SUPERGROUP_ID, F.reply_to_message)
+async def handle_operator_reply(message: Message, bot: Bot):
+    replied = message.reply_to_message
+    source_text = replied.caption or replied.text or ""
+
+    match = re.search(r"#ID_(\d+)", source_text)
+    if not match:
+        return
+
+    client_id = int(match.group(1))
+    operator = message.from_user.full_name
+
+    # Сценарий отказа с пояснением причины
+    if f"#REJECT_{client_id}" in source_text:
+        reason = message.text or message.caption
+        if not reason:
+            await message.reply("⚠️ Пожалуйста, напишите причину отказа обычным текстом.")
+            return
+
+        try:
+            await bot.send_message(
+                client_id,
+                "❌ <b>Ваша заявка отклонена исполнителем.</b>\n\n"
+                f"💬 <b>Причина отказа:</b> {reason}\n\n"
+                "Вы можете скорректировать данные и отправить новую заявку через кнопки на нижней панели.",
+                reply_markup=get_main_panel_kb()
+            )
+            clean_text = source_text.split("\n\n⚠️ <b>ОЖИДАЕТСЯ ПРИЧИНА ОТКАЗА")[0]
+            final_text = (
+                f"{clean_text}\n\n"
+                f"❌ <b>СТАТУС: ОТКАЗАНО ({operator})</b>\n"
+                f"💬 <b>Причина:</b> {reason}"
+            )
+            await _edit_group_msg(replied, final_text, reply_markup=None)
+            await message.reply("✅ Отказ с указанной причиной отправлен клиенту.")
+        except Exception as e:
+            await message.reply(f"❌ Ошибка при отправке отказа клиенту: {e}")
+        return
+
+    # Сценарий отправки готового заказа клиенту с запросом подтверждения приёма
+    confirm_prompt = (
+        "\n\n👇 Пожалуйста, проверьте результат и нажмите "
+        "<b>«✅ Подтвердить приём заказа»</b> на нижней панели."
+    )
+    confirm_kb = get_confirm_order_panel_kb()
+
+    try:
+        if message.document:
+            await bot.send_document(
+                client_id,
+                document=message.document.file_id,
+                caption=f"📦 <b>Ваш заказ готов!</b>\n\n{message.caption or 'Готовый файл / архив во вложении.'}{confirm_prompt}",
+                reply_markup=confirm_kb
+            )
+        elif message.audio:
+            await bot.send_audio(
+                client_id,
+                audio=message.audio.file_id,
+                caption=f"📦 <b>Ваш заказ готов!</b>\n\n{message.caption or ''}{confirm_prompt}",
+                reply_markup=confirm_kb
+            )
+        elif message.video:
+            await bot.send_video(
+                client_id,
+                video=message.video.file_id,
+                caption=f"📦 <b>Ваш заказ готов!</b>\n\n{message.caption or ''}{confirm_prompt}",
+                reply_markup=confirm_kb
+            )
+        elif message.photo:
+            await bot.send_photo(
+                client_id,
+                photo=message.photo[-1].file_id,
+                caption=f"📦 <b>Ваш заказ готов!</b>\n\n{message.caption or ''}{confirm_prompt}",
+                reply_markup=confirm_kb
+            )
+        elif message.text:
+            await bot.send_message(
+                client_id,
+                f"📦 <b>Ваш заказ готов!</b>\n\n"
+                f"Результат / ссылка на скачивание:\n{message.text}{confirm_prompt}",
+                reply_markup=confirm_kb
+            )
+        else:
+            await message.reply("⚠️ Отправьте клиенту документ (ZIP/файл), фото, аудио, видео или текстовую ссылку.")
+            return
+
+        await message.reply("✅ Результат доставлен клиенту! Ожидаем от него подтверждения приёма заказа.")
+    except Exception as e:
+        await message.reply(f"❌ Не удалось отправить результат клиенту: {e}")
+
+
+# ================= 6. ПОДТВЕРЖДЕНИЕ ПРИЁМА ЗАКАЗА И ОТЗЫВЫ =================
+@router.message(F.text == "✅ Подтвердить приём заказа")
+async def handle_client_confirm_order(message: Message, state: FSMContext, bot: Bot):
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "без юзернейма"
+
+    # Уведомляем исполнителей в супергруппе о том, что клиент принял заказ
+    try:
+        await bot.send_message(
+            SUPERGROUP_ID,
+            f"✅ <b>ЗАКАЗ ПОДТВЕРЖДЁН КЛИЕНТОМ</b> [#ID_{user.id}]\n"
+            f"👤 <b>Клиент:</b> {user.full_name} ({username}) успешно принял работу!"
+        )
+    except Exception as e:
+        logging.error(f"Не удалось отправить подтверждение в супергруппу: {e}")
+
+    # Показываем клиенту две кнопки: Оставить отзыв и Главное меню
+    await message.answer(
+        "🎉 <b>Спасибо! Приём заказа успешно подтверждён.</b>\n\n"
+        "Будем рады, если вы поделитесь впечатлениями по кнопке <b>«⭐️ Оставить отзыв»</b> "
+        "или вернётесь в <b>«🔙 В главное меню»</b> на нижней панели:",
+        reply_markup=get_after_confirm_panel_kb()
+    )
+
+
+@router.message(F.text == "⭐️ Оставить отзыв")
+async def handle_Leave_review_btn(message: Message, state: FSMContext):
+    await message.answer(
+        "✍️ <b>Напишите ваш отзыв в ответном сообщении:</b>\n"
+        "Мы передадим его нашей команде!",
+        reply_markup=get_back_panel_kb()
+    )
+    await state.set_state(OrderFlow.waiting_review)
+
+
+@router.message(OrderFlow.waiting_review, F.text)
+async def handle_review_text(message: Message, state: FSMContext, bot: Bot):
+    user = message.from_user
+    username = f"@{user.username}" if user.username else "без юзернейма"
+
+    try:
+        await bot.send_message(
+            SUPERGROUP_ID,
+            f"⭐️ <b>НОВЫЙ ОТЗЫВ ОТ КЛИЕНТА</b> [#ID_{user.id}]\n\n"
+            f"👤 <b>Клиент:</b> {user.full_name} ({username})\n"
+            f"💬 <b>Текст отзыва:</b>\n{message.text}"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка пересылки отзыва в супергруппу: {e}")
+
+    data = await state.get_data()
+    ad_source = data.get("ad_source", "Прямой заход (Органика)")
+    await state.clear()
+    await state.update_data(ad_source=ad_source)
+
+    await message.answer(
+        "❤️ <b>Спасибо за ваш отзыв!</b>\n\n"
+        "Вы возвращены в главное меню. Выберите нужную категорию на нижней панели:",
+        reply_markup=get_main_panel_kb()
+    )
+    await state.set_state(OrderFlow.choosing_service)
+
+
+# ================= ЗАПУСК БОТА =================
+async def main():
+    if USE_PYTHONANYWHERE_PROXY:
+        os.environ["HTTP_PROXY"] = "http://proxy.server:3128"
+        os.environ["HTTPS_PROXY"] = "http://proxy.server:3128"
+        session = PythonAnywhereSession()
+    else:
+        session = None
+
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=session,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    dp = Dispatcher()
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=True)
+    print("✅ Бот успешно запущен и слушает сообщения!")
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
